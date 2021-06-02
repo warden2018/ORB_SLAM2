@@ -64,6 +64,7 @@ void LoopClosing::Run()
         if(CheckNewKeyFrames())
         {
             // Detect loop candidates and check covisibility consistency
+            //找到了关键帧之后，需要先确认检测到了回环
             if(DetectLoop())
             {
                // Compute similarity transformation [sR|t]
@@ -100,6 +101,9 @@ bool LoopClosing::CheckNewKeyFrames()
     return(!mlpLoopKeyFrameQueue.empty());
 }
 
+/*
+*
+*/
 bool LoopClosing::DetectLoop()
 {
     {
@@ -121,8 +125,8 @@ bool LoopClosing::DetectLoop()
     // Compute reference BoW similarity score
     // This is the lowest score to a connected keyframe in the covisibility graph
     // We will impose loop candidates to have a higher similarity than this
-    const vector<KeyFrame*> vpConnectedKeyFrames = mpCurrentKF->GetVectorCovisibleKeyFrames();
-    const DBoW2::BowVector &CurrentBowVec = mpCurrentKF->mBowVec;
+    const vector<KeyFrame*> vpConnectedKeyFrames = mpCurrentKF->GetVectorCovisibleKeyFrames(); //获取和当前帧共视的所有关键帧
+    const DBoW2::BowVector &CurrentBowVec = mpCurrentKF->mBowVec; //当前帧的词袋向量
     float minScore = 1;
     for(size_t i=0; i<vpConnectedKeyFrames.size(); i++)
     {
@@ -135,9 +139,10 @@ bool LoopClosing::DetectLoop()
 
         if(score<minScore)
             minScore = score;
-    }
+    }//遍历所有共视关键帧，找到得分最低的那一帧
 
     // Query the database imposing the minimum score
+    //mpKeyFrameDB是所有关键帧的数据库。从数据库当中找到minScore为下限的所有帧--不一定是和上面的共视帧重合
     vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectLoopCandidates(mpCurrentKF, minScore);
 
     // If there are no loop candidates, just add new keyframe and return false
@@ -153,7 +158,11 @@ bool LoopClosing::DetectLoop()
     // Each candidate expands a covisibility group (keyframes connected to the loop candidate in the covisibility graph)
     // A group is consistent with a previous group if they share at least a keyframe
     // We must detect a consistent loop in several consecutive keyframes to accept it
-    mvpEnoughConsistentCandidates.clear();
+    
+    /*
+    *
+    * */
+    mvpEnoughConsistentCandidates.clear(); //KF的集合
 
     vector<ConsistentGroup> vCurrentConsistentGroups;
     vector<bool> vbConsistentGroup(mvConsistentGroups.size(),false);
