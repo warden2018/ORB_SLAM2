@@ -45,7 +45,7 @@ void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopF
     BundleAdjustment(vpKFs,vpMP,nIterations,pbStopFlag, nLoopKF, bRobust);
 }
 
-
+//对关键帧和地图点进行优化
 void Optimizer::BundleAdjustment(const vector<KeyFrame *> &vpKFs, const vector<MapPoint *> &vpMP,
                                  int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)
 {
@@ -1129,8 +1129,33 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
 * 单目在初始化时候，需要求解前后两帧的R和t.对极几何的约束在求解t的时候，是一个零等式的约束。也就是求解出来的t在缩放不同的倍数时候，得到的
 * t都能够满足那个对极约束的等式。通常的做法就是求到的t进行单位化，以后计算用到的这个scale就以单位化为准。为了解决这个问题，回环检测部分会重新
 * 利用优化的方法对当前的帧进行重新位姿计算。
-*
 */
+
+/**
+ * @brief 形成闭环时固定（不优化）地图点进行Sim3位姿优化
+ * 1. Vertex:
+ *     - g2o::VertexSim3Expmap()，两个关键帧的位姿
+ *     - g2o::VertexSBAPointXYZ()，两个关键帧共有的MapPoints
+ * 2. Edge:
+ *     - g2o::EdgeSim3ProjectXYZ()，BaseBinaryEdge
+ *         + Vertex：关键帧的Sim3，MapPoint的Pw
+ *         + measurement：MapPoint在关键帧中的二维位置(u,v)
+ *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
+ *     - g2o::EdgeInverseSim3ProjectXYZ()，BaseBinaryEdge
+ *         + Vertex：关键帧的Sim3，MapPoint的Pw
+ *         + measurement：MapPoint在关键帧中的二维位置(u,v)
+ *         + InfoMatrix: invSigma2(与特征点所在的尺度有关)
+ * 
+ * @param[in] pKF1              当前帧
+ * @param[in] pKF2              闭环候选帧
+ * @param[in] vpMatches1        两个关键帧之间的匹配关系
+ * @param[in] g2oS12            两个关键帧间的Sim3变换，方向是从2到1       
+ * @param[in] th2               卡方检验是否为误差边用到的阈值
+ * @param[in] bFixScale         是否优化尺度，单目进行尺度优化，双目/RGB-D不进行尺度优化
+ * @return int                  优化之后匹配点中内点的个数
+ */
+
+
 int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &vpMatches1, g2o::Sim3 &g2oS12, const float th2, const bool bFixScale)
 {
     g2o::SparseOptimizer optimizer;
@@ -1156,7 +1181,7 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
     // Set Sim3 vertex
     g2o::VertexSim3Expmap * vSim3 = new g2o::VertexSim3Expmap();    
     vSim3->_fix_scale=bFixScale;
-    vSim3->setEstimate(g2oS12);
+    vSim3->setEstimate(g2oS12); //设定从连续KF到当前KF的转换作为初始值
     vSim3->setId(0);
     vSim3->setFixed(false);
     vSim3->_principle_point1[0] = K1.at<float>(0,2); //把KF1和KF2的相机参数全部传递到VertexSim3Expmap顶点
@@ -1170,7 +1195,7 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
     optimizer.addVertex(vSim3);
 
     // Set MapPoint vertices
-    const int N = vpMatches1.size(); // vpMatches1是哪一类地图坐标点？
+    const int N = vpMatches1.size(); // vpMatches1是当前KF和回环的高连续KF共同看到的地图点
     const vector<MapPoint*> vpMapPoints1 = pKF1->GetMapPointMatches(); //KF中维护的MapPointMatches又是哪一类的点？
     vector<g2o::EdgeSim3ProjectXYZ*> vpEdges12;
     vector<g2o::EdgeInverseSim3ProjectXYZ*> vpEdges21;
@@ -1184,26 +1209,26 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
 
     int nCorrespondences = 0;
 
-    for(int i=0; i<N; i++)
+    for(int i=0; i<N; i++) //遍历每一个配对上的地图点
     {
         if(!vpMatches1[i])
             continue;
 
-        MapPoint* pMP1 = vpMapPoints1[i]; //
-        MapPoint* pMP2 = vpMatches1[i];
+        MapPoint* pMP1 = vpMapPoints1[i]; //当前KF看到的地图点
+        MapPoint* pMP2 = vpMatches1[i]; //共同看到的地图点
 
         const int id1 = 2*i+1;
         const int id2 = 2*(i+1);
 
         const int i2 = pMP2->GetIndexInKeyFrame(pKF2);
-
+        //如果地图点都是合格的，那么添加地图顶点，并且fix
         if(pMP1 && pMP2)
         {
             if(!pMP1->isBad() && !pMP2->isBad() && i2>=0)
             {
                 g2o::VertexSBAPointXYZ* vPoint1 = new g2o::VertexSBAPointXYZ(); //地图点的顶点是VertexSBAPointXYZ
                 cv::Mat P3D1w = pMP1->GetWorldPos(); //获取地图点的世界坐标
-                cv::Mat P3D1c = R1w*P3D1w + t1w; //计算这个地图点在相机坐标系下的坐标
+                cv::Mat P3D1c = R1w*P3D1w + t1w; //计算这个地图点在当前KF下的坐标
                 vPoint1->setEstimate(Converter::toVector3d(P3D1c));
                 vPoint1->setId(id1);
                 vPoint1->setFixed(true);
@@ -1211,7 +1236,7 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
 
                 g2o::VertexSBAPointXYZ* vPoint2 = new g2o::VertexSBAPointXYZ();
                 cv::Mat P3D2w = pMP2->GetWorldPos(); //地图点世界坐标
-                cv::Mat P3D2c = R2w*P3D2w + t2w; ////地图点在第二个KF坐标中的数值
+                cv::Mat P3D2c = R2w*P3D2w + t2w; ////地图点在回环KF的坐标
                 vPoint2->setEstimate(Converter::toVector3d(P3D2c));
                 vPoint2->setId(id2);
                 vPoint2->setFixed(true);
@@ -1226,12 +1251,13 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
         nCorrespondences++;
 
         // Set edge x1 = S12*X2
+        //需要说明的是，这里的边是正向投影，就是说投影的地图点是从回环KF来，投影的结果要和当前KF上面测量到的像素坐标作比对，形成误差
         Eigen::Matrix<double,2,1> obs1;
-        const cv::KeyPoint &kpUn1 = pKF1->mvKeysUn[i];
+        const cv::KeyPoint &kpUn1 = pKF1->mvKeysUn[i]; //当前KF的地图点测量值
         obs1 << kpUn1.pt.x, kpUn1.pt.y;
 
         g2o::EdgeSim3ProjectXYZ* e12 = new g2o::EdgeSim3ProjectXYZ();
-        e12->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id2)));
+        e12->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id2))); //回环KF的地图点
         e12->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(0)));
         e12->setMeasurement(obs1);
         const float &invSigmaSquare1 = pKF1->mvInvLevelSigma2[kpUn1.octave];
@@ -1243,13 +1269,14 @@ int Optimizer::OptimizeSim3(KeyFrame *pKF1, KeyFrame *pKF2, vector<MapPoint *> &
         optimizer.addEdge(e12);
 
         // Set edge x2 = S21*X1
+        //需要说明的是，这里的边是反向投影，就是说投影的地图点是从当前KF来，投影的结果要和回环KF上面测量到的像素坐标作比对，形成误差
         Eigen::Matrix<double,2,1> obs2;
         const cv::KeyPoint &kpUn2 = pKF2->mvKeysUn[i2];
-        obs2 << kpUn2.pt.x, kpUn2.pt.y;
+        obs2 << kpUn2.pt.x, kpUn2.pt.y; //回环KF下的像素测量值
 
         g2o::EdgeInverseSim3ProjectXYZ* e21 = new g2o::EdgeInverseSim3ProjectXYZ();
 
-        e21->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id1)));
+        e21->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(id1)));//当前KF的地图点
         e21->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(0)));
         e21->setMeasurement(obs2);
         float invSigmaSquare2 = pKF2->mvInvLevelSigma2[kpUn2.octave];

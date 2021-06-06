@@ -220,7 +220,7 @@ protected:
     std::set<KeyFrame*> mspLoopEdges;
 
     // Bad flags
-    bool mbNotErase;
+    bool mbNotErase; //不能被删除
     bool mbToBeErased;
     bool mbBad;    
 

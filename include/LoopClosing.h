@@ -112,7 +112,7 @@ protected:
 
     LocalMapping *mpLocalMapper;
 
-    std::list<KeyFrame*> mlpLoopKeyFrameQueue;
+    std::list<KeyFrame*> mlpLoopKeyFrameQueue; //KF的队列
 
     std::mutex mMutexLoopQueue;
 
@@ -130,7 +130,7 @@ protected:
     cv::Mat mScw;
     g2o::Sim3 mg2oScw;
 
-    long unsigned int mLastLoopKFid;
+    long unsigned int mLastLoopKFid; //上次检测到的闭环帧id,维护这个id是为了当前帧到达时做判断，看看是不是前后两帧距离太近
 
     // Variables related to Global Bundle Adjustment
     bool mbRunningGBA;

@@ -106,15 +106,16 @@ bool LoopClosing::CheckNewKeyFrames()
 */
 bool LoopClosing::DetectLoop()
 {
-    {
+    {   //1.从队列中取出KF,作为本次回环检测的KF
         unique_lock<mutex> lock(mMutexLoopQueue);
-        mpCurrentKF = mlpLoopKeyFrameQueue.front();
-        mlpLoopKeyFrameQueue.pop_front();
+        mpCurrentKF = mlpLoopKeyFrameQueue.front(); //取早进来的KF
+        mlpLoopKeyFrameQueue.pop_front(); //从队列中弹出，避免在当前线程操作时候被其他线程删除该KF
         // Avoid that a keyframe can be erased while it is being process by this thread
-        mpCurrentKF->SetNotErase();
+        mpCurrentKF->SetNotErase(); //当前KF不能在优化过程中删除
     }
 
     //If the map contains less than 10 KF or less than 10 KF have passed from last loop detection
+    //2.如果地图中包含的KF数量小于10或者当前KF距离上次的太近（小于10），那么当前的KF不会用来闭环检测，但是会放入mpKeyFrameDB
     if(mpCurrentKF->mnId<mLastLoopKFid+10)
     {
         mpKeyFrameDB->add(mpCurrentKF);
@@ -125,10 +126,12 @@ bool LoopClosing::DetectLoop()
     // Compute reference BoW similarity score
     // This is the lowest score to a connected keyframe in the covisibility graph
     // We will impose loop candidates to have a higher similarity than this
+    //3.遍历和当前KF共视地图点大于15的所有连接KF,通过词袋向量计算当前KF和这些KF们之间的最小得分minScore
+    //这个得分用来在步骤4中筛选出来和当前KF不直接相连但是有较相似的候选KF
     const vector<KeyFrame*> vpConnectedKeyFrames = mpCurrentKF->GetVectorCovisibleKeyFrames(); //获取和当前帧共视的所有关键帧
     const DBoW2::BowVector &CurrentBowVec = mpCurrentKF->mBowVec; //当前帧的词袋向量
     float minScore = 1;
-    for(size_t i=0; i<vpConnectedKeyFrames.size(); i++)
+    for(size_t i=0; i<vpConnectedKeyFrames.size(); i++) //遍历每一个共视KF
     {
         KeyFrame* pKF = vpConnectedKeyFrames[i];
         if(pKF->isBad())
@@ -142,10 +145,13 @@ bool LoopClosing::DetectLoop()
     }//遍历所有共视关键帧，找到得分最低的那一帧
 
     // Query the database imposing the minimum score
-    //mpKeyFrameDB是所有关键帧的数据库。从数据库当中找到minScore为下限的所有帧--不一定是和上面的共视帧重合
+    //4.在所有KF中找到闭环候选帧
+    //mpKeyFrameDB是所有KF的数据库。从数据库当中找到minScore为下限的所有帧,作为候选.
+    //之所以成为候选KF，是因为这些KF与当前KF具有较多的公共单词，相似度较高，很有可能形成回环。
     vector<KeyFrame*> vpCandidateKFs = mpKeyFrameDB->DetectLoopCandidates(mpCurrentKF, minScore);
 
     // If there are no loop candidates, just add new keyframe and return false
+    //如果没找到，那么就直接添加当前KF并且返回
     if(vpCandidateKFs.empty())
     {
         mpKeyFrameDB->add(mpCurrentKF);
@@ -158,49 +164,69 @@ bool LoopClosing::DetectLoop()
     // Each candidate expands a covisibility group (keyframes connected to the loop candidate in the covisibility graph)
     // A group is consistent with a previous group if they share at least a keyframe
     // We must detect a consistent loop in several consecutive keyframes to accept it
-    
+    //5.在候选KF中检测具有连续性的KF，想要检测单KF和候选之间的连续性，需要引入Group,基于Group检查连续性
+    //(1)每一个候选KF组成一个Group->spCandidateGroup
+    //(2)检查这个Group是否存在于mvConsistentGroups中，如果这个Group在里面，就放入vCurrentConsistentGroups
+    //(3)
     /*
-    *
+    *下面的代码要理解好，需要理解如下的概念：
+    *Group:每一个候选帧都拥有一些相连的KF,所有这些KFs组成了一个组 -- 候选组spCandidateGroup
+    *Consistent: 翻译过来就是连续关系，说的是Group之间是否具有连续关系。如果两个Group，G1和G2,共享了一个及以上的KF,
+    *那么G1和G2就具有连续关系。
+    *Consistentcy: 是连续性，代表累计的连续链条的长度。G1-G2 ->Consistentcy就是1；G1-G2-G3-G4 -> Consistentcy就是4.
+    *mvConsistentGroups：连续组，存储了上次闭环检测的组的信息，是一个网状的结构，意思是一个组可能和多个组之间建立了联系。
+    *连续组链条：在上面的连续组中，能够组成链条的一些组就是一个组链条
+    *子连续组：同上面的概念类似
     * */
-    mvpEnoughConsistentCandidates.clear(); //KF的集合
 
-    vector<ConsistentGroup> vCurrentConsistentGroups;
+    /*
+    *mvConsistentGroups: 连续组集合，网状结构
+    *ConsistentGroup数据类型为pair<set<KeyFrame*>,int>
+    *ConsistentGroup.first对应每个“连续组”中的关键帧，ConsistentGroup.second为每个“连续组”的已连续几个的序号
+    *
+    */
+    mvpEnoughConsistentCandidates.clear(); //从这个变量命名来看，就是足够连续的候选KF.所以，需要从vpCandidateKFs里面寻找。
+
+    vector<ConsistentGroup> vCurrentConsistentGroups; //当前连续组,初始化之后还没有任何数据。
     vector<bool> vbConsistentGroup(mvConsistentGroups.size(),false);
-    for(size_t i=0, iend=vpCandidateKFs.size(); i<iend; i++)
+    for(size_t i=0, iend=vpCandidateKFs.size(); i<iend; i++) //遍历每一个候选KF
     {
         KeyFrame* pCandidateKF = vpCandidateKFs[i];
 
-        set<KeyFrame*> spCandidateGroup = pCandidateKF->GetConnectedKeyFrames();
+        set<KeyFrame*> spCandidateGroup = pCandidateKF->GetConnectedKeyFrames(); //通过候选KF找出候选组
         spCandidateGroup.insert(pCandidateKF);
 
         bool bEnoughConsistent = false;
         bool bConsistentForSomeGroup = false;
-        for(size_t iG=0, iendG=mvConsistentGroups.size(); iG<iendG; iG++)
+        //遍历
+        for(size_t iG=0, iendG=mvConsistentGroups.size(); iG<iendG; iG++) //遍历上一次闭环检测后的连续组,是全局存在的
         {
-            set<KeyFrame*> sPreviousGroup = mvConsistentGroups[iG].first;
+            set<KeyFrame*> sPreviousGroup = mvConsistentGroups[iG].first; //取出一个闭环连续组
 
             bool bConsistent = false;
-            for(set<KeyFrame*>::iterator sit=spCandidateGroup.begin(), send=spCandidateGroup.end(); sit!=send;sit++)
+            for(set<KeyFrame*>::iterator sit=spCandidateGroup.begin(), send=spCandidateGroup.end(); sit!=send;sit++) //遍历候选组中的每一个KF
             {
                 if(sPreviousGroup.count(*sit))
                 {
+                    //如果candidateGroup中有任何一个KF在sPreviousGroup中，那么说明候选帧组里面有KF和历史连续帧组重叠，那么说明当前的sPreviousGroup可以考虑进来
                     bConsistent=true;
                     bConsistentForSomeGroup=true;
                     break;
                 }
             }
 
-            if(bConsistent)
+            if(bConsistent) //如果是连续，要继续看到底多连续
             {
-                int nPreviousConsistency = mvConsistentGroups[iG].second;
-                int nCurrentConsistency = nPreviousConsistency + 1;
-                if(!vbConsistentGroup[iG])
+                int nPreviousConsistency = mvConsistentGroups[iG].second; //取出连续组里面当前这个组的连续次数
+                int nCurrentConsistency = nPreviousConsistency + 1; //加一，说明新增了一个连续
+                if(!vbConsistentGroup[iG]) //如果上面的连续关系还没有记录到这个0,1序列，那么设置到对应的位置
                 {
                     ConsistentGroup cg = make_pair(spCandidateGroup,nCurrentConsistency);
-                    vCurrentConsistentGroups.push_back(cg);
+                    vCurrentConsistentGroups.push_back(cg);//把当前的候选组加入当前的vCurrentConsistentGroups
                     vbConsistentGroup[iG]=true; //this avoid to include the same group more than once
+                    //标记当前索引号下的连续组已经更新了
                 }
-                if(nCurrentConsistency>=mnCovisibilityConsistencyTh && !bEnoughConsistent)
+                if(nCurrentConsistency>=mnCovisibilityConsistencyTh && !bEnoughConsistent)//足够连续的判断条件：当前候选组和
                 {
                     mvpEnoughConsistentCandidates.push_back(pCandidateKF);
                     bEnoughConsistent=true; //this avoid to insert the same candidate more than once
@@ -330,7 +356,7 @@ bool LoopClosing::ComputeSim3()
                 cv::Mat t = pSolver->GetEstimatedTranslation();
                 const float s = pSolver->GetEstimatedScale();
                 matcher.SearchBySim3(mpCurrentKF,pKF,vpMapPointMatches,s,R,t,7.5);
-
+                //这里是从pKF到currentKF的Sim3变换；调用Optimizer::OptimizeSim3进一步优化，如果是单目，mbFixScale为0，如果是双目，为1
                 g2o::Sim3 gScm(Converter::toMatrix3d(R),Converter::toVector3d(t),s);
                 const int nInliers = Optimizer::OptimizeSim3(mpCurrentKF, pKF, vpMapPointMatches, gScm, 10, mbFixScale);
 
